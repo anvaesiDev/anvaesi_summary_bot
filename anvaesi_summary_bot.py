@@ -1,5 +1,6 @@
 import logging
 import re
+import time
 import urllib.parse
 from youtube_transcript_api import YouTubeTranscriptApi
 import yt_dlp
@@ -13,14 +14,16 @@ from bs4 import BeautifulSoup, NavigableString, Tag
 
 # Настройка логирования
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Инициализация Telegraph с сохранённым access_token
-telegraph = Telegraph(access_token="97c85721eb376ac68cd430907a7f48d3688ca22b3d4feed45e17a899ac40")
+telegraph = Telegraph(
+    access_token="97c85721eb376ac68cd430907a7f48d3688ca22b3d4feed45e17a899ac40"
+)
 
-# Вставьте сюда ваш OpenAI API-ключ и базовый URL (если требуется)
+# Настройки OpenAI API
 openai.api_base = "https://openrouter.ai/api/v1"
 openai.api_key = "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"
 
@@ -58,9 +61,16 @@ def process_video(video_url: str) -> list:
     except Exception as e:
         return ["Пожалуйста, отправьте корректную ссылку на YouTube видео.", ""]
 
-    # Получаем транскрипт видео на русском языке
+    # Получаем транскрипт видео на нужном языке: сначала пытаемся получить русский, иначе выбираем первый доступный
     try:
-        transcript_segments = YouTubeTranscriptApi.get_transcript(video_id, languages=['ru'])
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        try:
+            transcript = transcript_list.find_transcript(['ru'])
+        except Exception:
+            # Если транскрипт на русском недоступен, выбираем первый из доступных языков
+            available_langs = [t.language_code for t in transcript_list]
+            transcript = transcript_list.find_transcript(available_langs)
+        transcript_segments = transcript.fetch()
         transcript_text = " ".join(segment["text"] for segment in transcript_segments)
     except Exception as e:
         return [f"Ошибка при получении транскрипта: {e}", video_title]
@@ -94,17 +104,32 @@ def process_video(video_url: str) -> list:
 <b>Транскрипт видео:</b> {transcript_text}
 """
 
-    # Отправляем запрос к OpenAI для получения саммари
+    # Отправляем запрос к OpenAI для получения саммари с повторной попыткой в случае ошибки, связанной с "choices"
     try:
-        response = openai.ChatCompletion.create(
-            model="google/gemini-2.0-flash-exp:free",
-            messages=[
-                {"role": "user", "content": prompt}
-            ]
-        )
+        max_attempts = 3
+        attempt = 0
+        while attempt < max_attempts:
+            try:
+                response = openai.ChatCompletion.create(
+                    model="google/gemini-2.0-flash-exp:free",
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                break  # Если запрос успешен, выходим из цикла
+            except Exception as e:
+                if "choices" in str(e):
+                    attempt += 1
+                    time.sleep(5)  # Задержка 5 секунд перед повтором
+                else:
+                    raise e
+        else:
+            return [f"Ошибка при вызове ИИ: {e}", video_title]
         summary = response.choices[0].message.content
     except Exception as e:
         return [f"Ошибка при вызове ИИ: {e}", video_title]
+
+    # Удаляем обёртки ```html``` если они присутствуют
+    summary = re.sub(r"```html\s*", "", summary)
+    summary = re.sub(r"\s*```", "", summary)
 
     return [summary, video_title]
 
@@ -141,17 +166,21 @@ def html_to_telegraph_nodes(html: str) -> list:
 
 # Обработчик команды /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("Привет! Отправь мне ссылку на YouTube видео, и я пришлю тебе его саммари.")
+    await update.message.reply_text(
+        "Привет! Отправь мне ссылку на YouTube видео, и я пришлю тебе его саммари."
+    )
 
 # Обработчик текстовых сообщений (ожидается ссылка на видео)
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     video_url = update.message.text.strip()
     # Проверяем, что ссылка является ссылкой на YouTube
     if not (video_url.startswith("http") and extract_video_id(video_url)):
-        await update.message.reply_text("Пожалуйста, отправьте корректную ссылку на YouTube видео.")
+        await update.message.reply_text(
+            "Пожалуйста, отправьте корректную ссылку на YouTube видео.")
         return
 
-    processing_msg = await update.message.reply_text("Обрабатываю видео, подожди, пожалуйста...")
+    processing_msg = await update.message.reply_text(
+        "Обрабатываю видео, подожди, пожалуйста...")
     try:
         summary_and_title = process_video(video_url)
         summary = summary_and_title[0]
@@ -163,21 +192,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         nodes = html_to_telegraph_nodes(summary)
 
         try:
-            page = telegraph.create_page(
-                title=f"{video_title}",
-                author_name="anvaesi_summary_bot",
-                content=nodes
-            )
+            page = telegraph.create_page(title=f"{video_title}",
+                                         author_name="anvaesi_summary_bot",
+                                         content=nodes)
             page_url = page['url']
-            await update.message.reply_text(f"Саммари видео опубликовано на Telegra.ph:\n{page_url}")
+            await update.message.reply_text(
+                f"Саммари видео опубликовано на Telegra.ph:\n{page_url}")
         except Exception as e:
             max_length = 4000
             if len(summary) > max_length:
                 for i in range(0, len(summary), max_length):
-                    chunk = summary[i:i+max_length]
-                    await update.message.reply_text(chunk, parse_mode=ParseMode.HTML)
+                    chunk = summary[i:i + max_length]
+                    await update.message.reply_text(chunk,
+                                                    parse_mode=ParseMode.HTML)
             else:
-                await update.message.reply_text(summary, parse_mode=ParseMode.HTML)
+                await update.message.reply_text(summary,
+                                                parse_mode=ParseMode.HTML)
     finally:
         await processing_msg.delete()
 
@@ -185,8 +215,10 @@ def main() -> None:
     telegram_token = "7740753488:AAEmlrqxkd9p8NvcuofolfBLDBrUdWGJDso"
     application = Application.builder().token(telegram_token).build()
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.run_polling()
+
 
 if __name__ == '__main__':
     main()
