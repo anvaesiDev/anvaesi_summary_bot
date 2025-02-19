@@ -2,7 +2,7 @@ import logging
 import re
 import time
 import urllib.parse
-from youtube_transcript_api import YouTubeTranscriptApi
+import requests
 import yt_dlp
 import openai
 from telegram import Update
@@ -11,6 +11,20 @@ from telegram.constants import ParseMode
 from telegraph import Telegraph
 import io
 from bs4 import BeautifulSoup, NavigableString, Tag
+from youtube_transcript_api import YouTubeTranscriptApi
+
+# Monkey patch для youtube_transcript_api: устанавливаем кастомный User-Agent, имитирующий браузер
+import youtube_transcript_api._api as yt_api
+def patched_make_request(url, params=None, proxies=None):
+    headers = {
+        'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                       'AppleWebKit/537.36 (KHTML, like Gecko) '
+                       'Chrome/92.0.4515.107 Safari/537.36')
+    }
+    response = requests.get(url, params=params, headers=headers, proxies=proxies)
+    response.raise_for_status()
+    return response.text
+yt_api._make_request = patched_make_request
 
 # Настройка логирования
 logging.basicConfig(
@@ -25,7 +39,7 @@ telegraph = Telegraph(
 
 # Настройки OpenAI API
 openai.api_base = "https://openrouter.ai/api/v1"
-openai.api_key = "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"
+openai.api_key = "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"
 
 # Функция для извлечения video_id из URL
 def extract_video_id(url: str) -> str | None:
@@ -111,7 +125,7 @@ def process_video(video_url: str) -> list:
         while attempt < max_attempts:
             try:
                 response = openai.ChatCompletion.create(
-                    model="google/gemini-2.0-flash-exp:free",
+                    model="google/gemini-2.0-flash-lite-preview-02-05:free",
                     messages=[{"role": "user", "content": prompt}]
                 )
                 break  # Если запрос успешен, выходим из цикла
@@ -218,7 +232,6 @@ def main() -> None:
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.run_polling()
-
 
 if __name__ == '__main__':
     main()
